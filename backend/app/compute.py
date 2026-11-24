@@ -267,8 +267,92 @@ def delta_reconciler(
 
 
 # ------------------------------------------------------------------
-# helpers
+# offset_gap_view：分区缺口视图
+# 偏移永远按 (分区, 偏移) 二元组解释，同一数字偏移在不同分区各自独立，
+# 因此下列函数全部以分区为单位计算，绝不跨分区合并或共享状态。
 # ------------------------------------------------------------------
+
+def merge_offset_ranges(offsets: list[int]) -> list[dict[str, int]]:
+    """把离散偏移点合并成连续闭区间 [start, end]，并给出区间内偏移条数。"""
+    points = sorted({int(offset) for offset in offsets})
+    ranges: list[dict[str, int]] = []
+    for point in points:
+        if ranges and point == ranges[-1]["end"] + 1:
+            ranges[-1]["end"] = point
+            ranges[-1]["count"] += 1
+        else:
+            ranges.append({"start": point, "end": point, "count": 1})
+    return ranges
+
+
+def intersect_ranges(
+    requested: list[dict[str, int]],
+    available: list[dict[str, int]],
+) -> list[dict[str, int]]:
+    """求两组闭区间的交集并重新合并成连续区间。"""
+    points: list[int] = []
+    for req in requested:
+        for gap in available:
+            start = max(int(req["start"]), int(gap["start"]))
+            end = min(int(req["end"]), int(gap["end"]))
+            if start <= end:
+                points.extend(range(start, end + 1))
+    return merge_offset_ranges(points)
+
+
+def offset_gap_view(
+    watermarks: dict[str, int],
+    confirmed: dict[str, Any],
+    *,
+    base_offsets: dict[str, int] | None = None,
+    inflight: dict[str, bool] | None = None,
+) -> list[dict[str, Any]]:
+    """按分区把源分区偏移数据计算成缺口视图。
+
+    水位（含）以内、尚未确认的偏移即为缺口；水位之后表示该分区仍在写入。
+    每个分区独立计算，偏移 101 在 p1 与 p2 是两条互不相关的记录。
+    """
+    base_offsets = base_offsets or {}
+    inflight = inflight or {}
+    view: list[dict[str, Any]] = []
+    for partition in sorted(watermarks):
+        base = int(base_offsets.get(partition, 0))
+        watermark = int(watermarks[partition])
+        confirmed_set = {int(offset) for offset in confirmed.get(partition, set())}
+        in_window = {offset for offset in confirmed_set if base <= offset <= watermark}
+        missing = [offset for offset in range(base, watermark + 1) if offset not in confirmed_set]
+        view.append({
+            "partition": partition,
+            "base_offset": base,
+            "watermark": watermark,
+            "confirmed_count": len(in_window),
+            "gap_ranges": merge_offset_ranges(missing),
+            "unconfirmed_count": len(missing),
+            "inflight": bool(inflight.get(partition, True)),
+            "next_write_offset": watermark + 1,
+        })
+    return view
+
+
+def plan_recovery_reads(
+    requested_ranges: list[dict[str, int]],
+    gap_row: dict[str, Any],
+) -> tuple[list[dict[str, int]], list[int]]:
+    """把操作员选中的补读区间与当前缺口求交。
+
+    返回 (实际需要补读的区间, 选中但已经实际入湖而跳过的偏移)。
+    迟到确认会在这一步被剔除，保证不会重复读取或重复写入。
+    """
+    read_ranges = intersect_ranges(requested_ranges, gap_row.get("gap_ranges", []))
+    read_points: set[int] = set()
+    for rng in read_ranges:
+        read_points.update(range(rng["start"], rng["end"] + 1))
+    requested_points: set[int] = set()
+    for rng in requested_ranges:
+        requested_points.update(range(int(rng["start"]), int(rng["end"]) + 1))
+    skipped = sorted(requested_points - read_points)
+    return read_ranges, skipped
+
 
 def _compute_checksum(data: str) -> str:
     return hashlib.md5(data.encode()).hexdigest()[:12]

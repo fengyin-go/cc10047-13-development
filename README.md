@@ -77,5 +77,23 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 检查点恢复队列（分区缺口视图）
+
+流式摄入的源分区偏移会被计算成**分区缺口视图**，列出每个分区尚未确认的区间以及
+仍在写入的分区，值班员从视图直接选中缺口安排补读，补读结果回写恢复台账。偏移一律
+按「分区 + 偏移」解释，同一偏移不会跨分区复用。
+
+- 前端工作台：导航「检查点恢复队列」，路由 `/stream_checkpoint/recovery`，含
+  分区缺口视图、检查点恢复台账、检查点详情三个页签。
+- 后端接口（`app/routers/recovery.py`，固定路径先于通用资源路由注册）：
+  - `GET  /api/stream_checkpoint/gap-view` 分区缺口视图
+  - `POST /api/stream_checkpoint/confirm-offset` 迟到确认（数据已实际入湖）
+  - `POST /api/stream_checkpoint/recovery` 从视图选中区间提交补读（支持幂等键、断线模拟）
+  - `GET  /api/stream_checkpoint/recovery-ledger` 恢复台账（选中区间/读取范围/写入确认）
+  - `POST /api/stream_checkpoint/recovery/{id}/retry` 断线重试，只补尚未确认区间
+  - `GET  /api/stream_checkpoint/detail/{checkpoint_id}` 检查点详情与补读完成标记
+- 核心算法在 `app/compute.py`（`offset_gap_view`、`plan_recovery_reads` 等），
+  运行态台账在 `app/services/recovery_state.py`，并发相同补读只确认一份数据。
+
 领域：数据工程
 子方向：数仓与数据湖
